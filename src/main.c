@@ -2,7 +2,7 @@
  * WALL-E FORCE | ROBO SUMO AUTONOMO | ESP32-WROOM-32 | ESP-IDF 5.x
  * 1 HC-SR04 frontal + 3 TCRT5000 + ponte H TB6612FNG.
  * Referencia didatica: pulso TRIG 10us, largura do ECHO e timeout 25ms.
- * Versao dojo de 60cm: alcance curto, giro no proprio eixo, borda sempre prioritária.
+ * Versao experimental: ao detectar alvo, ataca por 5s SEM checar bordas.
  * Maquina de estados sem delays de movimentacao.
  * IMPORTANTISSIMO: HC-SR04 convencional VCC=5V; ECHO -> divisor para 3,3V.
  * Os TCRT5000 devem fornecer saida logica de 3,3 V ao ESP32.
@@ -37,7 +37,7 @@
 #define NIVEL_BORDA 0              // AJUSTAR conforme sensores na faixa branca
 #define INVERTER_MOTOR_ESQUERDO 1  // confirmar com rodas suspensas
 #define INVERTER_MOTOR_DIREITO 1   // confirmar com rodas suspensas
-#define IGNORAR_BORDAS_NO_ATAQUE 0 // dojo 60cm: borda TEM prioridade sempre
+#define IGNORAR_BORDAS_NO_ATAQUE 1 // durante os 5s: bordas ignoradas (RISCO DE SAIDA)
 #define GIRO_BUSCA_UM_MOTOR 0      // 0: giro no eixo com motores em sentidos opostos
 #define DISTANCIA_ATAQUE_CM 35     // evita detectar objetos fora do dojo
 #define DISTANCIA_LIBERAR_CM 40
@@ -56,6 +56,7 @@
 #define PASSO_LOOP_MS 10
 #define LOG_CADA_MS 350
 #define PARTIDA_SEGUNDOS 5
+#define TEMPO_ATAQUE_CEGO_MS 3000 
 
 // ========================= 3. ESTADOS ===========================
 typedef enum
@@ -94,6 +95,7 @@ static int64_t fim_fase_us = 0;
 static int64_t proximo_ping_us = 0;
 static int64_t ultima_deteccao_us = 0;
 static int64_t ultimo_log_us = 0;
+static int64_t fim_ataque_cegous = 0;
 static int distancia_frente_cm = -1;
 static unsigned leituras_longe = 0;
 static TaskHandle_t tarefa_principal = NULL;
@@ -358,6 +360,38 @@ static void executar_evasao(void)
 // ========================= 8. COMBATE ===========================
 static void controlar_robo(void)
 {
+    int64_t t = agora_us();
+
+    // ATAQUE TEMPORIZADO: deliberadamente nao consulta IR nem ultrassonico
+    // durante 5s. A ISR ainda pode notificar, mas o motor NAO e interrompido.
+    // ATENCAO: dojo de 60cm: pode atravessar a faixa e sair da arena!
+    if (estado == ATACANDO)
+    {
+        if (t < fim_ataque_cegous)
+            return;
+
+        // Ao finalizar a janela de 5s, examina PRIMEIRO as bordas.
+        printf("ATAQUE 5s ENCERRADO -> VERIFICANDO BORDAS\n");
+        estado = BUSCANDO;
+        bordas_t b_pos_ataque = ler_bordas();
+        if (tem_borda(b_pos_ataque))
+        {
+            if (bordas_opostas(b_pos_ataque))
+            {
+                estado = PARADO_SEGURANCA;
+                mover(MOV_PARAR);
+            }
+            else
+                iniciar_evasao(b_pos_ataque);
+            return;
+        }
+        // Sem borda: para o ataque e volta a procurar.
+        // Proxima leitura valida pode iniciar outra janela de 5s.
+        mover(MOV_GIRO_DIREITA);
+        proximo_ping_us = 0;
+        return;
+    }
+
     bordas_t b = ler_bordas();
     if (estado == PARADO_SEGURANCA)
     {
@@ -376,8 +410,8 @@ static void controlar_robo(void)
         return;
     }
 
-    bool proteger_borda = !(estado == ATACANDO && IGNORAR_BORDAS_NO_ATAQUE);
-    if (proteger_borda && tem_borda(b))
+    // Durante a BUSCA, a borda continua com prioridade.
+    if (tem_borda(b))
     {
         if (bordas_opostas(b))
         {
@@ -385,63 +419,34 @@ static void controlar_robo(void)
             mover(MOV_PARAR);
         }
         else
-        {
             iniciar_evasao(b);
-        }
         return;
     }
 
-    int64_t t = agora_us();
     if (t < proximo_ping_us)
         return;
-    distancia_frente_cm = ler_HC_SR04(proteger_borda);
+    distancia_frente_cm = ler_HC_SR04(true);
     t = agora_us();
     proximo_ping_us = t + ms_us(INTERVALO_PING_MS);
 
+    // Borda que surgiu durante a medicao tem prioridade antes do ataque.
     b = ler_bordas();
-    if (proteger_borda && tem_borda(b))
-        return; // proxima passagem aciona evasao
+    if (tem_borda(b))
+        return;
 
     if (distancia_frente_cm >= 2 && distancia_frente_cm <= DISTANCIA_ATAQUE_CM)
     {
-        ultima_deteccao_us = t;
-        leituras_longe = 0;
-        if (estado != ATACANDO)
-        {
-            printf("ALVO %d cm -> ATAQUE\n", distancia_frente_cm);
-            estado = ATACANDO;
-            mover(MOV_ATAQUE);
-        }
+        printf("ALVO %d cm -> ATAQUE CONTINUO POR 5s\n", distancia_frente_cm);
+        estado = ATACANDO;
+        fim_ataque_cegous = t + ms_us(TEMPO_ATAQUE_CEGO_MS);
+        mover(MOV_ATAQUE);
+        return;
     }
-    else if (estado == ATACANDO)
-    {
-        if (distancia_frente_cm > DISTANCIA_LIBERAR_CM)
-        {
-            if (++leituras_longe >= LEITURAS_LONGE_SAIR)
-            {
-                printf("ALVO LONGE -> BUSCA\n");
-                estado = BUSCANDO;
-                leituras_longe = 0;
-                mover(MOV_GIRO_DIREITA);
-            }
-        }
-        else if (t - ultima_deteccao_us >= ms_us(TOLERANCIA_ECHO_INVALIDO_MS))
-        {
-            // ECHO=-1 ou 81..85cm: nao prolonga ataque indefinidamente.
-            printf("ALVO PERDIDO -> BUSCA\n");
-            estado = BUSCANDO;
-            leituras_longe = 0;
-            mover(MOV_GIRO_DIREITA);
-        }
-    }
-    if (estado == BUSCANDO)
-        mover(MOV_GIRO_DIREITA);
+
+    mover(MOV_GIRO_DIREITA);
     if (t - ultimo_log_us >= ms_us(LOG_CADA_MS))
     {
-        printf("FRENTE=%d cm | ESTADO=%s\n", distancia_frente_cm,
-               estado == ATACANDO ? "ATACANDO" : estado == BUSCANDO ? "BUSCANDO"
-                                             : estado == EVADINDO   ? "EVADINDO"
-                                                                    : "PARADO");
+        printf("FRENTE=%d cm | ESTADO=BUSCANDO\n", distancia_frente_cm);
         ultimo_log_us = t;
     }
 }
@@ -452,7 +457,7 @@ void setup(void)
     configurar_motores();
     configurar_ultrassonico();
     configurar_infravermelhos();
-    printf("WALL-E FORCE | COMPETICAO | HC-SR04 FRONTAL + 3 IR\n");
+    printf("WALL-E FORCE | TESTE ATAQUE 5s | HC-SR04 FRONTAL + 3 IR\n");
     for (int i = PARTIDA_SEGUNDOS; i > 0; --i)
     {
         printf("INICIO EM %d...\n", i);
